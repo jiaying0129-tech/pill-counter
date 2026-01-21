@@ -3,121 +3,105 @@ import cv2
 import numpy as np
 
 # --- 1. 介面設定 ---
-st.set_page_config(page_title="AI 聚光燈數藥丸", layout="centered")
+st.set_page_config(page_title="幾何鎖定數藥丸", layout="centered")
 st.markdown("""
     <style>
-    .main { background-color: #0E1117; color: white; }
-    h1 { color: #00FF00; text-align: center; }
+    .main { background-color: #262730; color: white; }
+    h1 { color: #00e6e6; text-align: center; }
     .stButton>button { 
-        width: 100%; border-radius: 50px; height: 70px; 
-        font-size: 24px; font-weight: bold;
-        background-color: #00CC00; color: white;
+        width: 100%; border-radius: 50px; height: 72px; 
+        font-size: 28px; font-weight: bold;
+        background-color: #00e6e6; color: black; border: none;
     }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("💊 AI 聚光燈數藥丸")
-st.warning("🎯 請將藥丸放在畫面**正中間**。程式會自動把周圍塗黑，無視背景。")
+st.title("💊 幾何鎖定數藥丸")
+st.info("🔹 這個版本使用「幾何圓形偵測」，專門過濾木紋背景與藥丸上的刻痕。")
 
-# --- 2. 核心邏輯：聚光燈演算法 ---
-def spotlight_analysis(img_buffer):
+# --- 2. 只有一個必要的滑桿 (視野控制) ---
+# 為了適應你手機拿遠拿近，這是唯一保留的調整項
+with st.expander("🔎 如果抓到背景，請調整這裡 (視野範圍)"):
+    scope_size = st.slider("偵測範圍 (只看中間)", 0.3, 0.9, 0.55, help="數值越小，只看越中心，能避開更多背景")
+
+# --- 3. 核心邏輯：霍夫圓形變換 + 強力聚光燈 ---
+def geometry_analysis(img_buffer, scope):
     # 讀取
     file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, 1)
     h, w = img.shape[:2]
     
-    # === 第一步：建立強力聚光燈 (Spotlight Mask) ===
-    # 這是解決你問題的關鍵！
-    # 我們建立一個全黑的遮罩，只在正中間挖一個洞
+    # === 第一步：建立聚光燈遮罩 (Spotlight) ===
+    # 畫一個黑色的遮罩，只留中間
     mask = np.zeros((h, w), dtype=np.uint8)
     center_x, center_y = w // 2, h // 2
-    
-    # 設定半徑為短邊的 35% (非常積極的過濾，強制只看中間)
-    radius = int(min(h, w) * 0.35)
+    radius = int(min(h, w) * scope / 2)
     cv2.circle(mask, (center_x, center_y), radius, 255, -1)
     
-    # 套用遮罩：遮罩外的東西全部變全黑 (R=0, G=0, B=0)
-    img_spotlight = cv2.bitwise_and(img, img, mask=mask)
+    # 套用遮罩
+    img_masked = cv2.bitwise_and(img, img, mask=mask)
     
-    # === 第二步：綠色通道分析 (Green Channel) ===
-    # 對於粉紅藥丸與木紋背景，綠色通道通常是最乾淨的
-    b, g, r = cv2.split(img_spotlight)
-    gray = g
+    # === 第二步：影像前處理 (關鍵！) ===
+    # 轉灰階
+    gray = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
     
-    # === 第三步：對比度極限增強 ===
-    # 讓藥丸亮到爆，背景暗下去
-    clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(gray)
+    # [超級關鍵] 強力高斯模糊
+    # 這步會把藥丸上的 "R" 字刻痕模糊掉，讓整顆藥丸看起來像一個光滑的饅頭
+    # 這樣電腦就不會把 "R" 的陰影誤判成另一顆藥丸
+    blurred = cv2.GaussianBlur(gray, (15, 15), 2)
     
-    # === 第四步：閾值處理 (Threshold) ===
-    # 這裡我們用一個技巧：只對「有亮光的地方」做 Otsu
-    # 這樣黑色的背景就不會干擾計算
-    # 先做高斯模糊去噪
-    blurred = cv2.GaussianBlur(enhanced, (15, 15), 0)
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # 再次強制套用圓形遮罩 (確保邊緣沒有殘留白邊)
-    binary = cv2.bitwise_and(binary, binary, mask=mask)
-    
-    # === 第五步：分離黏在一起的藥丸 ===
-    # 距離變換
-    dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    
-    # 找峰值 (Peaks)
-    # 這裡設定 0.5 (50% 亮度)，這是一個很安全的數值，能分開大部分圓形藥丸
-    _, peaks = cv2.threshold(dist_transform, 0.5 * dist_transform.max(), 255, 0)
-    peaks = np.uint8(peaks)
-    
-    # === 第六步：計數與雙重過濾 ===
-    cnts, _ = cv2.findContours(peaks, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # === 第三步：霍夫圓形偵測 (Hough Circles) ===
+    # 這是工業界專門用來找圓形物體的演算法
+    # dp=1.2: 解析度
+    # minDist=40: 兩顆藥丸圓心的最小距離 (避免重複算)
+    # param1=50: 邊緣偵測閾值
+    # param2=30: 圓形判定閾值 (越小越容易判定是圓)
+    circles = cv2.HoughCircles(
+        blurred, 
+        cv2.HOUGH_GRADIENT, 
+        dp=1.2, 
+        minDist=radius/4, # 動態調整最小距離
+        param1=50, 
+        param2=25, 
+        minRadius=int(radius/10), # 限制藥丸最小多大
+        maxRadius=int(radius/3)   # 限制藥丸最大多大
+    )
     
     count = 0
-    output_img = img.copy() # 畫在原圖上
+    output_img = img.copy()
     
-    # 畫出聚光燈範圍給使用者看
-    cv2.circle(output_img, (center_x, center_y), radius, (0, 255, 255), 2)
+    # 畫出偵測範圍 (黃色圈) 讓你知道電腦在看哪裡
+    cv2.circle(output_img, (center_x, center_y), radius, (0, 255, 255), 3)
     
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < 10: continue # 過濾極小噪點
-        
-        # 計算中心點
-        M = cv2.moments(c)
-        if M["m00"] != 0:
-            cX = int(M["m10"] / M["m00"])
-            cY = int(M["m01"] / M["m00"])
-            
-            # 【終極過濾】：如果偵測點離圓心太遠，一定是誤判 (比如蓋子邊緣)
-            dist_from_center = np.sqrt((cX - center_x)**2 + (cY - center_y)**2)
-            if dist_from_center > radius * 0.9:
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype("int")
+        for (x, y, r) in circles:
+            # 雙重確認：只有在聚光燈範圍內的圓才算
+            dist_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+            if dist_from_center > radius:
                 continue
-            
+                
             count += 1
-            
-            # 畫標記
-            cv2.circle(output_img, (cX, cY), 8, (0, 0, 255), -1) # 紅點
-            cv2.circle(output_img, (cX, cY), 20, (0, 255, 0), 2) # 綠圈
-            cv2.putText(output_img, str(count), (cX-10, cY-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            # 畫出偵測到的藥丸 (鮮豔綠色)
+            cv2.circle(output_img, (x, y), r, (0, 255, 0), 4)
+            cv2.circle(output_img, (x, y), 5, (0, 0, 255), -1) # 圓心
+            cv2.putText(output_img, str(count), (x-10, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 3)
 
-    return count, output_img, binary, img_spotlight
+    return count, output_img, blurred
 
-# --- 3. 執行區 ---
-img_file = st.camera_input("📸 請點此拍照")
+# --- 4. 執行區 ---
+img_file = st.camera_input("📸 請拍照")
 
 if img_file is not None:
-    count, result_img, debug_bin, debug_spot = spotlight_analysis(img_file)
+    count, result_img, debug_blur = geometry_analysis(img_file, scope_size)
     
+    # 顯示結果
     st.success("分析完成！")
-    st.markdown(f"<div style='text-align: center; font-size: 80px; font-weight: bold; color: #00FF00;'>{count} 顆</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='text-align: center; font-size: 80px; font-weight: bold; color: #00e6e6;'>{count} 顆</div>", unsafe_allow_html=True)
     
-    st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), caption="AI 偵測結果 (黃圈內為偵測範圍)", use_container_width=True)
+    st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), caption="偵測結果 (黃圈是視野範圍)", use_container_width=True)
     
-    with st.expander("👀 為什麼這次雜訊不見了？"):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(debug_spot, caption="1. 聚光燈效果", use_container_width=True)
-            st.write("程式強制把周圍塗黑，木紋直接消失。")
-        with col2:
-            st.image(debug_bin, caption="2. 最終判讀", use_container_width=True)
-            st.write("乾淨的黑白影像，只剩中間的藥丸。")
+    with st.expander("👀 檢查電腦是否「眼花」？ (除錯影像)"):
+        st.image(debug_blur, caption="電腦看到的模糊影像", use_container_width=True)
+        st.caption("藥丸應該要看起來像模糊的光滑圓球，上面的 R 字應該要看不見。")

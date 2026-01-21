@@ -2,134 +2,130 @@ import streamlit as st
 import cv2
 import numpy as np
 
-# --- 1. 頁面設定 ---
-st.set_page_config(page_title="AI 藥丸計數器 (色彩鎖定版)", layout="centered")
+st.set_page_config(page_title="全能藥丸計數器", layout="centered")
 
 st.markdown("""
     <style>
     .main { background-color: #f0f2f6; }
-    h1 { color: #4B0082; text-align: center; }
-    .stButton>button { width: 100%; border-radius: 20px; }
+    h1 { color: #2e86c1; text-align: center; }
+    .stButton>button { width: 100%; border-radius: 20px; font-weight: bold; }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("💊 藥丸計數器 - 色彩鎖定版")
-st.info("💡 這個版本專門對付「木紋背景」和「複雜雜訊」。請依照下方教學調整顏色滑桿。")
+st.title("💊 全能藥丸計數器")
+st.info("💡 這個版本透過「形狀特徵」來辨識，可同時計算圓形、膠囊與不同大小的藥丸。")
 
-# --- 2. 側邊欄：強大的除錯參數 ---
-with st.expander("🛠️ 參數調整 (第一步請先調這裡)", expanded=True):
-    st.write("### 1. 範圍限制")
-    mask_radius = st.slider("圓形遮罩大小 (去除角落背景)", 0.1, 1.0, 0.85, help="只保留畫面中心圓圈內的影像，周圍塗黑")
+# --- 側邊欄：強大的過濾器 ---
+with st.expander("🎛️ 參數控制台 (調整核心)", expanded=True):
+    st.write("### 1. 影像優化 (去除木紋)")
+    # 雙邊濾波是去除木紋的神器，能保邊去噪
+    blur_strength = st.slider("磨皮強度 (去除紋路)", 1, 50, 25, help="數值越高，木紋越不明顯，但藥丸邊緣需保持清晰")
+    contrast = st.slider("對比度增強", 1.0, 3.0, 1.5)
     
-    st.write("### 2. 顏色過濾 (HSV)")
-    st.write("調整下方滑桿，直到**只有藥丸是白色，背景全黑**")
-    # 預設值針對淺粉/白色藥丸優化
-    h_min = st.slider("色調下限 (H-min)", 0, 179, 0)
-    h_max = st.slider("色調上限 (H-max)", 0, 179, 179)
-    s_min = st.slider("飽和度下限 (S-min)", 0, 255, 0)
-    s_max = st.slider("飽和度上限 (S-max)", 0, 255, 100) # 藥丸通常飽和度低(偏白)
-    v_min = st.slider("亮度下限 (V-min)", 0, 255, 140) # 藥丸通常很亮
-    v_max = st.slider("亮度上限 (V-max)", 0, 255, 255)
+    st.write("### 2. 邊緣偵測")
+    canny_min = st.slider("邊緣敏銳度 (Min)", 10, 200, 50)
+    canny_max = st.slider("邊緣敏銳度 (Max)", 50, 300, 150)
+    
+    st.write("### 3. 形狀過濾器 (關鍵！)")
+    col1, col2 = st.columns(2)
+    with col1:
+        min_area = st.number_input("最小面積", value=100)
+        max_area = st.number_input("最大面積", value=5000)
+    with col2:
+        # 圓度：1.0 是正圓，0.5 是膠囊，0.1 是長條
+        min_circularity = st.slider("形狀限制 (圓度)", 0.0, 1.0, 0.4, help="1.0=只要正圓, 0.4=包含橢圓/膠囊")
 
-    st.write("### 3. 形狀優化")
-    fill_holes = st.checkbox("填補藥丸孔洞", value=True, help="如果藥丸中間被誤判成黑色，請勾選此項")
-    min_area = st.slider("最小面積 (過濾雜點)", 10, 500, 150)
-    sep_force = st.slider("分離強度 (分開黏住的藥丸)", 0.0, 1.0, 0.5)
-
-# --- 3. 核心處理邏輯 ---
+# --- 核心邏輯 ---
 def process_image(img_buffer):
-    # 讀取
+    # 1. 讀取圖片
     file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, 1)
-    h, w = img.shape[:2]
     
-    # === 步驟 1: 圓形遮罩 (強制去除角落木紋) ===
-    mask = np.zeros((h, w), dtype=np.uint8)
-    center = (int(w//2), int(h//2))
-    radius = int(min(h, w) / 2 * mask_radius)
-    cv2.circle(mask, center, radius, 255, -1)
+    # 2. 影像增強 (對比度)
+    # 讓藥丸跟背景分離更明顯
+    img_float = img.astype(float) * contrast
+    img_float[img_float > 255] = 255
+    img = img_float.astype(np.uint8)
     
-    # 套用遮罩：遮罩外變全黑
-    masked_img = cv2.bitwise_and(img, img, mask=mask)
-
-    # === 步驟 2: HSV 顏色過濾 ===
-    hsv = cv2.cvtColor(masked_img, cv2.COLOR_BGR2HSV)
-    lower_bound = np.array([h_min, s_min, v_min])
-    upper_bound = np.array([h_max, s_max, v_max])
+    # 3. 強力去噪 (雙邊濾波 Bilateral Filter)
+    # 這是對付木紋的關鍵，它會模糊紋理但保留藥丸邊緣
+    filtered = cv2.bilateralFilter(img, 9, 75, 75)
+    gray = cv2.cvtColor(filtered, cv2.COLOR_BGR2GRAY)
     
-    # 產生二值化圖 (符合顏色的變白，其餘變黑)
-    thresh = cv2.inRange(hsv, lower_bound, upper_bound)
+    # 也可以疊加高斯模糊
+    if blur_strength > 0:
+        # 確保核大小是奇數
+        k_size = blur_strength if blur_strength % 2 == 1 else blur_strength + 1
+        gray = cv2.GaussianBlur(gray, (k_size, k_size), 0)
     
-    # === 步驟 3: 形態學處理 (修補) ===
-    kernel = np.ones((5,5), np.uint8)
+    # 4. 邊緣偵測 (Canny)
+    edged = cv2.Canny(gray, canny_min, canny_max)
     
-    # 先閉運算 (把藥丸內部的小洞補起來)
-    if fill_holes:
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-        
-        # 進階填洞：尋找輪廓並把內部塗白
-        contours_fill, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours_fill:
-            cv2.drawContours(thresh, [c], 0, 255, -1)
-
-    # 開運算 (去除背景小白點雜訊)
-    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-
-    # === 步驟 4: 分水嶺演算法 (切開黏住的藥丸) ===
-    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-    _, sure_fg = cv2.threshold(dist_transform, sep_force * dist_transform.max(), 255, 0)
-    sure_fg = np.uint8(sure_fg)
+    # 5. 形態學閉運算 (把邊緣斷掉的地方接起來)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
     
-    # === 步驟 5: 最終計數 ===
-    cnts, _ = cv2.findContours(sure_fg.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 6. 找輪廓
+    cnts, _ = cv2.findContours(closed.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     count = 0
     output_img = img.copy()
+    valid_contours = []
     
     for c in cnts:
-        if cv2.contourArea(c) < min_area:
+        area = cv2.contourArea(c)
+        
+        # 過濾 1: 面積
+        if area < min_area or area > max_area:
             continue
             
+        # 過濾 2: 圓度 (Circularity)
+        # 公式: 4 * Pi * Area / (Perimeter^2)
+        perimeter = cv2.arcLength(c, True)
+        if perimeter == 0: continue
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        
+        if circularity < min_circularity:
+            continue
+            
+        # 通過所有測試！
         count += 1
-        # 找中心並畫圖
+        valid_contours.append(c)
+        
+        # 畫圖
+        cv2.drawContours(output_img, [c], -1, (0, 255, 0), 3)
+        
+        # 標記數字
         M = cv2.moments(c)
         if M["m00"] != 0:
             cX = int(M["m10"] / M["m00"])
             cY = int(M["m01"] / M["m00"])
-            cv2.circle(output_img, (cX, cY), 10, (0, 0, 255), -1)
-            cv2.putText(output_img, str(count), (cX-10, cY-15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            
-            # 畫框
-            x, y, w_rect, h_rect = cv2.boundingRect(c)
-            cv2.rectangle(output_img, (x, y), (x + w_rect, y + h_rect), (0, 255, 0), 2)
+            cv2.putText(output_img, str(count), (cX - 10, cY - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-    return count, output_img, masked_img, thresh, sure_fg
+    return count, output_img, gray, closed
 
-# --- 4. 介面顯示 ---
+# --- 介面 ---
 img_file = st.camera_input("📸 請拍照")
 
 if img_file is not None:
-    count, result_img, masked_view, binary_view, core_view = process_image(img_file)
+    count, result_img, debug_gray, debug_edge = process_image(img_file)
     
-    st.markdown(f"<h2 style='text-align: center; color: green;'>共發現 {count} 顆</h2>", unsafe_allow_html=True)
-    st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), caption="最終結果", use_container_width=True)
+    st.success(f"✅ 共發現 {count} 顆")
+    st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), caption="偵測結果", use_container_width=True)
     
-    st.write("---")
-    st.subheader("👀 調整教學 (必看！)")
-    st.write("請依照下方三個影像來調整滑桿，直到**中間那張圖**變得很完美。")
-
-    col1, col2, col3 = st.columns(3)
+    st.markdown("---")
+    st.write("### 🔍 除錯視窗 (如果沒抓到，請看這裡)")
+    col1, col2 = st.columns(2)
     with col1:
-        st.write("**1. 範圍遮罩**")
-        st.image(cv2.cvtColor(masked_view, cv2.COLOR_BGR2RGB), caption="只看中間", use_container_width=True)
-        st.caption("調整 `圓形遮罩大小`，把周圍的木紋切掉。")
-    
+        st.image(debug_gray, caption="1. 電腦看到的亮度 (木紋是否消失?)", use_container_width=True)
     with col2:
-        st.write("**2. 顏色過濾 (最重要)**")
-        st.image(binary_view, caption="黑白二值圖", use_container_width=True)
-        st.caption("調整 `S-max` (飽和度) 和 `V-min` (亮度)。目標：**藥丸全白，背景全黑**。")
-
-    with col3:
-        st.write("**3. 最終核心**")
-        st.image(core_view, caption="計數核心", use_container_width=True, clamp=True)
-        st.caption("這是電腦最後數的點。")
+        st.image(debug_edge, caption="2. 電腦抓到的邊緣 (線條是否完整?)", use_container_width=True)
+        
+    st.info("""
+    **🔧 調整攻略：**
+    1. **木紋太明顯？** 👉 調高「磨皮強度」。
+    2. **邊緣斷斷續續？** 👉 降低「邊緣敏銳度 (Min)」。
+    3. **膠囊沒抓到？** 👉 降低「形狀限制 (圓度)」到 0.4 或更低。
+    4. **抓到太多背景雜點？** 👉 調高「最小面積」。
+    """)
